@@ -1,1 +1,6 @@
-
+flask
+pillow
+pymupdf
+qrcode
+pywin32
+pyinstaller
