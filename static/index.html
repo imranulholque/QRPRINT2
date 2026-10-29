@@ -1,0 +1,207 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phone Print</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--tx:#1b1f24;--mut:#6b7280;--pri:#2563eb;--bd:#e5e7eb}
+@media(prefers-color-scheme:dark){:root{--bg:#111418;--card:#1b2027;--tx:#e8eaed;--mut:#9aa3af;--bd:#2d343d}}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--tx)}
+.wrap{max-width:640px;margin:0 auto;padding:14px}
+h1{font-size:20px;margin:6px 0 14px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-bottom:10px}
+button,select,.btn{font:inherit;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--tx);padding:10px 14px}
+button.p,.btn.p{background:var(--pri);color:#fff;border-color:var(--pri)}
+button.x{padding:8px 12px;color:#dc2626}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.grow{flex:1;min-width:0}
+.name{font-weight:600;overflow-wrap:anywhere}
+.mut{color:var(--mut);font-size:14px}
+input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:center;width:100%;padding:10px;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--tx)}
+.btn{display:inline-block;cursor:pointer}
+#dlg{position:fixed;inset:0;background:var(--bg);overflow:auto;z-index:5}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.pg{display:flex;flex-direction:column;gap:4px;font-size:13px;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:6px}
+.pg img{width:100%;border-radius:6px;background:#fff}
+.field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.field select{width:100%}
+.sheet{text-align:center;margin:12px 0}
+.sheet img{width:100%;max-width:420px;box-shadow:0 2px 10px rgba(0,0,0,.3);background:#fff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📄 Phone Print</h1>
+
+  <div id="login" class="card" hidden>
+    <p>Enter the 4-digit PIN shown on the PC</p>
+    <input id="pin" type="tel" inputmode="numeric" maxlength="4" autocomplete="off">
+    <p id="lerr" style="color:#dc2626"></p>
+    <button id="go" class="p" style="width:100%">Open</button>
+  </div>
+
+  <div id="main" hidden>
+    <div class="card">
+      <label class="btn p">Choose files (PDF / images)
+        <input id="pick" type="file" multiple accept=".pdf,image/*" hidden>
+      </label>
+      <p id="ustat" class="mut"></p>
+    </div>
+    <div id="list"></div>
+    <div id="all" class="card" hidden>
+      <div class="name">Print all (merged)</div>
+      <p class="mut">PDF and images are never mixed together.</p>
+      <div class="row" id="allbtns"></div>
+      <p><button id="clear" class="x">Remove all files</button></p>
+    </div>
+  </div>
+</div>
+
+<div id="dlg" hidden>
+  <div class="wrap">
+    <div class="row"><button id="close">← Back</button><div class="name grow" id="ptitle"></div></div>
+    <p class="mut">Select pages to print</p>
+    <div class="grid" id="pgrid"></div>
+    <div class="card" style="margin-top:14px">
+      <div class="field"><label>Printer</label><select id="printer"></select></div>
+      <div class="field"><label>Paper size</label><select id="paper"></select></div>
+      <div class="field"><label>Color</label><select id="color"></select></div>
+      <div class="field" id="duprow"><label>Two-sided</label>
+        <select id="duplex">
+          <option value="off">Off (one side)</option>
+          <option value="long">Long edge</option>
+          <option value="short">Short edge</option>
+        </select></div>
+      <p class="mut" id="dnote"></p>
+      <div class="row">
+        <button id="bprev" class="grow">👁 Preview</button>
+        <button id="bprint" class="grow p">🖨 Print</button>
+      </div>
+      <p id="pmsg"></p>
+    </div>
+    <div id="prev"></div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+let FILES=[],CAPS=null,CUR=null;
+function el(t,props={},...kids){const e=document.createElement(t);Object.assign(e,props);kids.forEach(k=>e.append(k));return e}
+async function api(url,opt){const r=await fetch(url,opt);if(r.status===401){show('login');throw new Error('login')}return r}
+function show(v){$('#login').hidden=v!=='login';$('#main').hidden=v!=='main'}
+const JH={'Content-Type':'application/json'};
+
+$('#go').onclick=async()=>{
+  const r=await fetch('/api/login',{method:'POST',headers:JH,body:JSON.stringify({pin:$('#pin').value})});
+  const j=await r.json();
+  if(r.ok){$('#lerr').textContent='';init()}else $('#lerr').textContent=j.error;
+};
+async function init(){show('main');await loadFiles()}
+async function loadFiles(){const r=await api('/api/files');FILES=await r.json();render()}
+
+$('#pick').onchange=async e=>{
+  const fs=[...e.target.files];let i=0;
+  for(const f of fs){i++;await up(f,i,fs.length)}
+  e.target.value='';$('#ustat').textContent='';loadFiles();
+};
+function up(f,i,n){return new Promise(res=>{
+  const x=new XMLHttpRequest();x.open('POST','/api/upload');
+  x.upload.onprogress=ev=>{if(ev.lengthComputable)$('#ustat').textContent=`Uploading ${i}/${n}: ${f.name} ${Math.round(ev.loaded/ev.total*100)}%`};
+  x.onload=()=>{if(x.status!==200){try{alert(JSON.parse(x.responseText).error)}catch{}}res()};
+  x.onerror=()=>{alert('Upload failed: '+f.name);res()};
+  const fd=new FormData();fd.append('file',f);x.send(fd);
+})}
+
+function render(){
+  const L=$('#list');L.innerHTML='';
+  FILES.forEach(f=>{
+    const meta=f.kind==='pdf'?`PDF · ${f.pages} page${f.pages>1?'s':''}`:'Image';
+    const b=el('button',{className:'p',textContent:'🖨 Print'});
+    b.onclick=()=>openPrint(f.name,Array.from({length:f.pages},(_,i)=>({f:f.id,p:i,label:'Page '+(i+1)})));
+    const d=el('button',{className:'x',textContent:'✕'});
+    d.onclick=async()=>{await api('/api/files/'+f.id,{method:'DELETE'});loadFiles()};
+    L.append(el('div',{className:'card'},el('div',{className:'row'},
+      el('div',{className:'grow'},el('div',{className:'name',textContent:f.name}),el('div',{className:'mut',textContent:meta})),b,d)));
+  });
+  $('#all').hidden=!FILES.length;
+  const A=$('#allbtns');A.innerHTML='';
+  [['pdf','PDFs'],['img','images']].forEach(([k,t])=>{
+    const fl=FILES.filter(f=>f.kind===k);if(!fl.length)return;
+    const tot=fl.reduce((a,f)=>a+f.pages,0);
+    const b=el('button',{className:'p',textContent:`🖨 Print all ${t} (${tot} page${tot>1?'s':''})`});
+    b.onclick=()=>{let n=0,pages=[];fl.forEach(f=>{for(let i=0;i<f.pages;i++){n++;pages.push({f:f.id,p:i,label:`${n}. ${f.name}${f.pages>1?' (p'+(i+1)+')':''}`})}});openPrint('All '+t,pages)};
+    A.append(b);
+  });
+}
+$('#clear').onclick=async()=>{if(confirm('Remove all files?')){await api('/api/files',{method:'DELETE'});loadFiles()}};
+
+function msg(t){$('#pmsg').textContent=t}
+function openPrint(title,pages){
+  CUR={title,pages};$('#ptitle').textContent=title;
+  const g=$('#pgrid');g.innerHTML='';
+  pages.forEach(p=>{
+    const lb=el('label',{className:'pg'},el('input',{type:'checkbox',checked:true}),
+      el('img',{loading:'lazy',src:`/api/thumb?f=${p.f}&p=${p.p}`}),el('span',{textContent:p.label}));
+    p.cb=lb.firstChild;g.append(lb);
+  });
+  $('#prev').innerHTML='';msg('');$('#dlg').hidden=false;loadPrinters();
+}
+$('#close').onclick=()=>{$('#dlg').hidden=true};
+
+async function loadPrinters(){
+  const s=$('#printer');s.innerHTML='';
+  const r=await api('/api/printers');const l=await r.json();
+  if(!Array.isArray(l)||!l.length){msg('No printer found on this PC.');return}
+  l.forEach(p=>s.append(new Option(`${p.name}  [${p.usb?'USB':p.port}]${p.default?' ★':''}`,p.name)));
+  s.onchange=loadCaps;loadCaps();
+}
+async function loadCaps(){
+  msg('Reading printer settings…');
+  const r=await api('/api/printer?name='+encodeURIComponent($('#printer').value));
+  CAPS=await r.json();
+  if(CAPS.error){msg('Error: '+CAPS.error);return}
+  msg('');
+  const P=$('#paper');P.innerHTML='';
+  CAPS.papers.forEach(p=>P.append(new Option(p.name+(p.custom?' (custom)':'')+(p.name===CAPS.defaults.paper?' – driver default':''),p.name)));
+  if(CAPS.defaults.paper)P.value=CAPS.defaults.paper;
+  const C=$('#color');C.innerHTML='';
+  if(CAPS.color){C.append(new Option('Color','color'));C.append(new Option('Black & White','mono'));C.value=CAPS.defaults.color?'color':'mono'}
+  else C.append(new Option('Black & White (printer has no color)','mono'));
+  $('#duprow').hidden=!CAPS.duplex;
+  if(CAPS.duplex)$('#duplex').value=CAPS.defaults.duplex;
+  const dn={off:'one side',long:'two-sided long edge',short:'two-sided short edge'};
+  $('#dnote').textContent=`Driver default: ${CAPS.defaults.paper||'?'}, ${CAPS.defaults.color?'Color':'B&W'}${CAPS.duplex?', '+dn[CAPS.defaults.duplex]:''}`;
+}
+const sel=()=>CUR.pages.filter(p=>p.cb.checked);
+
+$('#bprev').onclick=()=>{
+  const pp=CAPS&&CAPS.papers?CAPS.papers.find(x=>x.name===$('#paper').value):null;
+  const w=(pp&&pp.w)||210,h=(pp&&pp.h)||297,mono=$('#color').value==='mono'?1:0;
+  const box=$('#prev');box.innerHTML='';const s=sel();
+  s.forEach((p,i)=>box.append(el('div',{className:'sheet'},
+    el('img',{src:`/api/preview?f=${p.f}&p=${p.p}&w=${w}&h=${h}&mono=${mono}`}),
+    el('small',{textContent:`Page ${i+1} of ${s.length}`}))));
+  box.scrollIntoView();
+};
+$('#bprint').onclick=async()=>{
+  const s=sel();if(!s.length)return alert('Select at least one page');
+  if(!CAPS||CAPS.error)return alert('Select a printer first');
+  const body={printer:$('#printer').value,paper:$('#paper').value,color:$('#color').value,
+    duplex:CAPS.duplex?$('#duplex').value:'off',pages:s.map(p=>[p.f,p.p]),title:CUR.title};
+  msg('Sending…');
+  const r=await api('/api/print',{method:'POST',headers:JH,body:JSON.stringify(body)});
+  const j=await r.json();if(!r.ok){msg('Error: '+j.error);return}
+  poll(j.id,s.length);
+};
+async function poll(id,n){
+  const r=await api('/api/job/'+id);const j=await r.json();
+  if(j.state==='run'){msg(`Printing ${j.done}/${n}…`);setTimeout(()=>poll(id,n),700)}
+  else if(j.state==='done')msg('✓ Sent to printer');
+  else msg('Error: '+j.error);
+}
+fetch('/api/files').then(r=>{if(r.status===401)show('login');else init()});
+</script>
+</body>
+</html>
