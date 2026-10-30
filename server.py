@@ -1,4 +1,4 @@
-import os, sys, io, uuid, time, hmac, shutil, tempfile, threading, atexit
+import os, sys, io, uuid, time, hmac, json, shutil, tempfile, threading, atexit
 from flask import Flask, request, jsonify, session, send_file
 import fitz
 from PIL import Image, ImageOps
@@ -20,6 +20,39 @@ JOBS = {}
 LOCK = threading.Lock()
 fails = {"n": 0, "until": 0}
 IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+# ---- printer profiles (saved by this app only, never written to Windows printer settings)
+PROF_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "PhonePrint")
+PROF_FILE = os.path.join(PROF_DIR, "profiles.json")
+PLOCK = threading.Lock()
+DIALOG_LOCK = threading.Lock()  # only one driver window at a time
+
+
+def load_profiles():
+    try:
+        with open(PROF_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_profiles(d):
+    os.makedirs(PROF_DIR, exist_ok=True)
+    tmp = PROF_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    os.replace(tmp, PROF_FILE)
+
+
+def find_profile(printer, pid):
+    if not pid:
+        return None
+    with PLOCK:
+        for p in load_profiles().get(printer, []):
+            if p["id"] == pid:
+                return p["data"]
+    return None
 
 
 def cleanup():
@@ -251,6 +284,60 @@ def printer():
         return jsonify(error=str(e)), 500
 
 
+# ------------------------------------------------------------------ profiles
+@app.get("/api/profiles")
+def profiles_list():
+    name = request.args.get("printer", "")
+    with PLOCK:
+        items = load_profiles().get(name, [])
+    return jsonify([{"id": p["id"], "name": p["name"]} for p in items])
+
+
+@app.post("/api/profiles/new")
+def profiles_new():
+    """Opens the driver's own settings window on the PC (like Word's Printer Properties).
+    Returns a job id; poll /api/job/<id>. State 'done' = saved, 'cancel' = user pressed Cancel."""
+    d = request.get_json(silent=True) or {}
+    printer_name = str(d.get("printer", ""))
+    pname = str(d.get("name", "")).strip()[:40]
+    if not printer_name or not pname:
+        return jsonify(error="Printer and profile name are required"), 400
+    if DIALOG_LOCK.locked():
+        return jsonify(error="A settings window is already open on the PC"), 409
+    base = find_profile(printer_name, d.get("base"))
+    jid = uuid.uuid4().hex[:8]
+    JOBS[jid] = {"state": "run", "kind": "profile"}
+
+    def run():
+        with DIALOG_LOCK:
+            try:
+                data = printing.driver_dialog(printer_name, base)
+                if data is None:
+                    JOBS[jid]["state"] = "cancel"
+                    return
+                pid = uuid.uuid4().hex[:8]
+                with PLOCK:
+                    allp = load_profiles()
+                    allp.setdefault(printer_name, []).append({"id": pid, "name": pname, "data": data})
+                    save_profiles(allp)
+                JOBS[jid].update(state="done", profile={"id": pid, "name": pname})
+            except Exception as e:
+                JOBS[jid].update(state="error", error=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify(id=jid)
+
+
+@app.delete("/api/profiles/<pid>")
+def profiles_delete(pid):
+    name = request.args.get("printer", "")
+    with PLOCK:
+        allp = load_profiles()
+        allp[name] = [p for p in allp.get(name, []) if p["id"] != pid]
+        save_profiles(allp)
+    return jsonify(ok=True)
+
+
 @app.post("/api/print")
 def do_print():
     d = request.get_json(silent=True) or {}
@@ -270,6 +357,7 @@ def do_print():
     jid = uuid.uuid4().hex[:8]
     JOBS[jid] = {"state": "run", "done": 0, "total": len(pages) * copies}
     color = d.get("color") == "color"
+    profile = find_profile(d.get("printer", ""), d.get("profile"))  # None = normal way
 
     def run():
         try:
@@ -277,7 +365,7 @@ def do_print():
                 d["printer"], d.get("paper"), color, d.get("duplex", "off"), orient, copies, len(pages),
                 lambda i, W, H, m: compose(pages[i][0], pages[i][1], W, H, m, True),
                 lambda done, total: JOBS[jid].update(done=done, total=total),
-                d.get("title", "Phone Print"))
+                d.get("title", "Phone Print"), profile=profile)
             JOBS[jid]["state"] = "done"
         except Exception as e:
             JOBS[jid].update(state="error", error=str(e))
