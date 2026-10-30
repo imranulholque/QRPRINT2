@@ -1,3 +1,4 @@
+import base64
 import win32print, win32ui, win32gui
 from PIL import ImageWin, Image
 
@@ -6,6 +7,16 @@ DM_COPIES, DM_COLOR, DM_DUPLEX, DM_FORMNAME = 0x100, 0x800, 0x1000, 0x10000
 DC_PAPERS, DC_PAPERSIZE, DC_DUPLEX, DC_PAPERNAMES, DC_COLORDEVICE = 2, 3, 7, 16, 32
 HORZRES, VERTRES, LOGPIXELSX, LOGPIXELSY = 8, 10, 88, 90
 PHYSICALWIDTH, PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY = 110, 111, 112, 113
+
+# DocumentProperties modes
+DM_OUT_BUFFER, DM_IN_PROMPT, DM_IN_BUFFER = 2, 4, 8
+IDOK = 1
+
+# Public DEVMODE fields we save in a profile (driver private data is saved separately)
+PROFILE_FIELDS = ["Orientation", "PaperSize", "PaperLength", "PaperWidth", "Scale",
+                  "Copies", "DefaultSource", "PrintQuality", "Color", "Duplex",
+                  "YResolution", "TTOption", "Collate", "MediaType", "DitherType",
+                  "ICMMethod", "ICMIntent"]
 
 
 def list_printers():
@@ -98,17 +109,97 @@ def caps(name):
             "duplex": cap(DC_DUPLEX) == 1, "defaults": d}
 
 
-def build_dm(name, paper, color, duplex, orient, c):
-    """Take the driver's own default settings and change only what the user chose."""
+# ---------------------------------------------------------------- profiles
+def _default_dm(name):
+    """The driver's own current default settings (a copy; nothing is written back)."""
     h = win32print.OpenPrinter(name)
     try:
         dm = win32print.GetPrinter(h, 2).get("pDevMode")
         if dm is None:
-            dm = win32print.DocumentProperties(0, h, name, None, None, 2)
+            dm = win32print.DocumentProperties(0, h, name, None, None, DM_OUT_BUFFER)
     finally:
         win32print.ClosePrinter(h)
     if dm is None:
         raise RuntimeError("This printer driver gave no settings")
+    return dm
+
+
+def dm_to_profile(dm):
+    """Turn a DEVMODE into a JSON-safe dict (public fields + driver private bytes)."""
+    p = {"Fields": int(dm.Fields)}
+    for k in PROFILE_FIELDS:
+        try:
+            p[k] = int(getattr(dm, k))
+        except Exception:
+            pass
+    try:
+        p["FormName"] = (dm.FormName or "").strip("\x00")
+    except Exception:
+        pass
+    try:
+        p["DriverData"] = base64.b64encode(bytes(dm.DriverData)).decode("ascii")
+    except Exception:
+        p["DriverData"] = ""
+    return p
+
+
+def apply_profile(dm, p):
+    """Copy a saved profile onto a DEVMODE. Private driver bytes are only applied
+    if the size matches this driver's, otherwise they are skipped (old/other driver)."""
+    try:
+        data = base64.b64decode(p.get("DriverData") or "")
+        if data and len(data) == len(bytes(dm.DriverData)):
+            dm.DriverData = data
+    except Exception:
+        pass
+    for k in PROFILE_FIELDS:
+        if k in p:
+            try:
+                setattr(dm, k, p[k])
+            except Exception:
+                pass
+    if p.get("FormName"):
+        try:
+            dm.FormName = p["FormName"]
+        except Exception:
+            pass
+    if "Fields" in p:
+        try:
+            dm.Fields = p["Fields"]
+        except Exception:
+            pass
+    return dm
+
+
+def driver_dialog(name, base_profile=None):
+    """Open the printer driver's own settings window (like Word's Printer Properties).
+    Starts from the printer's current defaults (or from base_profile).
+    Returns a profile dict, or None if the user pressed Cancel.
+    Nothing is saved to Windows: printer defaults on the PC stay untouched."""
+    base = _default_dm(name)
+    if base_profile:
+        apply_profile(base, base_profile)
+    h = win32print.OpenPrinter(name)
+    try:
+        out = win32print.DocumentProperties(0, h, name, None, None, DM_OUT_BUFFER)
+        r = win32print.DocumentProperties(0, h, name, out, base,
+                                          DM_IN_BUFFER | DM_IN_PROMPT | DM_OUT_BUFFER)
+    finally:
+        win32print.ClosePrinter(h)
+    if isinstance(r, int) and r != IDOK:
+        return None
+    result = out if (r is None or isinstance(r, int)) else r
+    return dm_to_profile(result)
+
+
+# ------------------------------------------------------------- print job
+def build_dm(name, paper, color, duplex, orient, c, profile=None):
+    """Take the driver's own default settings and change only what the user chose.
+    If a profile is given, it is applied first (driver-specific options like paper
+    type, quality, 2-sided); paper, orientation, color and copies still follow the phone."""
+    dm = _default_dm(name)
+    if profile:
+        apply_profile(dm, profile)
 
     p = next((x for x in c["papers"] if x["name"] == paper), None)
     if p:
@@ -133,7 +224,8 @@ def build_dm(name, paper, color, duplex, orient, c):
         dm.Fields |= DM_COLOR
     else:
         color = False
-    if c["duplex"]:
+    if c["duplex"] and not profile:
+        # with a profile, the profile decides duplex
         dm.Duplex = {"long": 2, "short": 3}.get(duplex, 1)
         dm.Fields |= DM_DUPLEX
     return dm, color
@@ -161,10 +253,24 @@ def area(name, paper, color, duplex, orient):
         hdc.DeleteDC()
 
 
-def print_job(name, paper, color, duplex, orient, copies, n, provider, progress, title="Phone Print"):
+def print_job(name, paper, color, duplex, orient, copies, n, provider, progress,
+              title="Phone Print", profile=None):
     c = caps(name)
-    dm, color = build_dm(name, paper, color, duplex, orient, c)
-    two_sided = c["duplex"] and duplex != "off"
+    try:
+        dm, color = build_dm(name, paper, color, duplex, orient, c, profile)
+        hdc = open_dc(name, dm)
+    except Exception:
+        if not profile:
+            raise
+        # profile did not work with this driver: fall back to the normal way
+        profile = None
+        dm, color = build_dm(name, paper, color, duplex, orient, c, None)
+        hdc = open_dc(name, dm)
+
+    try:
+        two_sided = bool(c["duplex"]) and int(dm.Duplex) in (2, 3)
+    except Exception:
+        two_sided = False
 
     seq = []
     for k in range(copies):
@@ -172,7 +278,6 @@ def print_job(name, paper, color, duplex, orient, copies, n, provider, progress,
         if two_sided and n % 2 == 1 and k < copies - 1:
             seq.append(None)  # blank back side so the next copy starts on a new sheet
 
-    hdc = open_dc(name, dm)
     try:
         W, H = hdc.GetDeviceCaps(HORZRES), hdc.GetDeviceCaps(VERTRES)
         dpi = hdc.GetDeviceCaps(LOGPIXELSX) or 300
