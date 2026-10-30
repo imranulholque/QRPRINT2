@@ -12,7 +12,7 @@ body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--tx
 .wrap{max-width:640px;margin:0 auto;padding:14px}
 h1{font-size:20px;margin:6px 0 14px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-bottom:10px}
-button,select,.btn{font:inherit;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--tx);padding:10px 14px}
+button,select,input[type=number],.btn{font:inherit;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--tx);padding:10px 14px}
 button.p,.btn.p{background:var(--pri);color:#fff;border-color:var(--pri)}
 button.x{padding:8px 12px;color:#dc2626}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -26,9 +26,9 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
 .pg{display:flex;flex-direction:column;gap:4px;font-size:13px;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:6px}
 .pg img{width:100%;border-radius:6px;background:#fff}
 .field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
-.field select{width:100%}
+.field select,.field input{width:100%}
 .sheet{text-align:center;margin:12px 0}
-.sheet img{width:100%;max-width:420px;box-shadow:0 2px 10px rgba(0,0,0,.3);background:#fff}
+.sheet img{width:100%;max-width:420px;box-shadow:0 2px 10px rgba(0,0,0,.3)}
 </style>
 </head>
 <body>
@@ -67,6 +67,12 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
     <div class="card" style="margin-top:14px">
       <div class="field"><label>Printer</label><select id="printer"></select></div>
       <div class="field"><label>Paper size</label><select id="paper"></select></div>
+      <div class="field"><label>Orientation</label>
+        <select id="orient">
+          <option value="auto">Auto (match the page)</option>
+          <option value="portrait">Portrait</option>
+          <option value="landscape">Landscape</option>
+        </select></div>
       <div class="field"><label>Color</label><select id="color"></select></div>
       <div class="field" id="duprow"><label>Two-sided</label>
         <select id="duplex">
@@ -74,6 +80,7 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
           <option value="long">Long edge</option>
           <option value="short">Short edge</option>
         </select></div>
+      <div class="field"><label>Copies</label><input id="copies" type="number" min="1" max="99" value="1" inputmode="numeric"></div>
       <p class="mut" id="dnote"></p>
       <div class="row">
         <button id="bprev" class="grow">👁 Preview</button>
@@ -81,6 +88,7 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
       </div>
       <p id="pmsg"></p>
     </div>
+    <p class="mut" id="ainfo"></p>
     <div id="prev"></div>
   </div>
 </div>
@@ -119,7 +127,7 @@ function render(){
   FILES.forEach(f=>{
     const meta=f.kind==='pdf'?`PDF · ${f.pages} page${f.pages>1?'s':''}`:'Image';
     const b=el('button',{className:'p',textContent:'🖨 Print'});
-    b.onclick=()=>openPrint(f.name,Array.from({length:f.pages},(_,i)=>({f:f.id,p:i,label:'Page '+(i+1)})));
+    b.onclick=()=>openPrint(f.name,Array.from({length:f.pages},(_,i)=>({f:f.id,p:i,land:f.lands[i],label:'Page '+(i+1)})));
     const d=el('button',{className:'x',textContent:'✕'});
     d.onclick=async()=>{await api('/api/files/'+f.id,{method:'DELETE'});loadFiles()};
     L.append(el('div',{className:'card'},el('div',{className:'row'},
@@ -131,7 +139,7 @@ function render(){
     const fl=FILES.filter(f=>f.kind===k);if(!fl.length)return;
     const tot=fl.reduce((a,f)=>a+f.pages,0);
     const b=el('button',{className:'p',textContent:`🖨 Print all ${t} (${tot} page${tot>1?'s':''})`});
-    b.onclick=()=>{let n=0,pages=[];fl.forEach(f=>{for(let i=0;i<f.pages;i++){n++;pages.push({f:f.id,p:i,label:`${n}. ${f.name}${f.pages>1?' (p'+(i+1)+')':''}`})}});openPrint('All '+t,pages)};
+    b.onclick=()=>{let n=0,pages=[];fl.forEach(f=>{for(let i=0;i<f.pages;i++){n++;pages.push({f:f.id,p:i,land:f.lands[i],label:`${n}. ${f.name}${f.pages>1?' (p'+(i+1)+')':''}`})}});openPrint('All '+t,pages)};
     A.append(b);
   });
 }
@@ -146,7 +154,8 @@ function openPrint(title,pages){
       el('img',{loading:'lazy',src:`/api/thumb?f=${p.f}&p=${p.p}`}),el('span',{textContent:p.label}));
     p.cb=lb.firstChild;g.append(lb);
   });
-  $('#prev').innerHTML='';msg('');$('#dlg').hidden=false;loadPrinters();
+  $('#prev').innerHTML='';$('#ainfo').textContent='';msg('');$('#copies').value=1;$('#orient').value='auto';
+  $('#dlg').hidden=false;loadPrinters();
 }
 $('#close').onclick=()=>{$('#dlg').hidden=true};
 
@@ -175,29 +184,47 @@ async function loadCaps(){
   $('#dnote').textContent=`Driver default: ${CAPS.defaults.paper||'?'}, ${CAPS.defaults.color?'Color':'B&W'}${CAPS.duplex?', '+dn[CAPS.defaults.duplex]:''}`;
 }
 const sel=()=>CUR.pages.filter(p=>p.cb.checked);
-
-$('#bprev').onclick=()=>{
+function orient(){
+  const v=$('#orient').value;if(v!=='auto')return v;
+  const s=sel()[0];return s&&s.land?'landscape':'portrait';
+}
+function params(){
   const pp=CAPS&&CAPS.papers?CAPS.papers.find(x=>x.name===$('#paper').value):null;
-  const w=(pp&&pp.w)||210,h=(pp&&pp.h)||297,mono=$('#color').value==='mono'?1:0;
-  const box=$('#prev');box.innerHTML='';const s=sel();
+  return new URLSearchParams({printer:$('#printer').value,paper:$('#paper').value,color:$('#color').value,
+    duplex:CAPS&&CAPS.duplex?$('#duplex').value:'off',orient:orient(),
+    w:(pp&&pp.w)||210,h:(pp&&pp.h)||297}).toString();
+}
+
+$('#bprev').onclick=async()=>{
+  const s=sel();if(!s.length)return alert('Select at least one page');
+  const q=params();
+  const box=$('#prev');box.innerHTML='';
   s.forEach((p,i)=>box.append(el('div',{className:'sheet'},
-    el('img',{src:`/api/preview?f=${p.f}&p=${p.p}&w=${w}&h=${h}&mono=${mono}`}),
+    el('img',{src:`/api/preview?f=${p.f}&p=${p.p}&${q}`}),
     el('small',{textContent:`Page ${i+1} of ${s.length}`}))));
-  box.scrollIntoView();
+  try{
+    const a=await (await api('/api/area?'+q)).json();
+    $('#ainfo').textContent=(a.driver?'From driver: ':'Estimated: ')+
+      `paper ${a.pw.toFixed(0)} × ${a.ph.toFixed(0)} mm, printable area ${a.aw.toFixed(0)} × ${a.ah.toFixed(0)} mm. `+
+      'Gray = printer cannot print there. The page is fitted inside the white area.';
+  }catch{}
+  $('#ainfo').scrollIntoView();
 };
 $('#bprint').onclick=async()=>{
   const s=sel();if(!s.length)return alert('Select at least one page');
   if(!CAPS||CAPS.error)return alert('Select a printer first');
+  const copies=Math.max(1,Math.min(99,parseInt($('#copies').value)||1));
   const body={printer:$('#printer').value,paper:$('#paper').value,color:$('#color').value,
-    duplex:CAPS.duplex?$('#duplex').value:'off',pages:s.map(p=>[p.f,p.p]),title:CUR.title};
+    duplex:CAPS.duplex?$('#duplex').value:'off',orient:orient(),copies,
+    pages:s.map(p=>[p.f,p.p]),title:CUR.title};
   msg('Sending…');
   const r=await api('/api/print',{method:'POST',headers:JH,body:JSON.stringify(body)});
   const j=await r.json();if(!r.ok){msg('Error: '+j.error);return}
-  poll(j.id,s.length);
+  poll(j.id);
 };
-async function poll(id,n){
+async function poll(id){
   const r=await api('/api/job/'+id);const j=await r.json();
-  if(j.state==='run'){msg(`Printing ${j.done}/${n}…`);setTimeout(()=>poll(id,n),700)}
+  if(j.state==='run'){msg(`Printing ${j.done}/${j.total}…`);setTimeout(()=>poll(id),700)}
   else if(j.state==='done')msg('✓ Sent to printer');
   else msg('Error: '+j.error);
 }
