@@ -1,5 +1,5 @@
 import base64
-import win32print, win32ui, win32gui
+import win32print, win32ui, win32gui, win32con, win32api
 from PIL import ImageWin, Image
 
 DM_ORIENTATION, DM_PAPERSIZE, DM_PAPERLENGTH, DM_PAPERWIDTH = 0x1, 0x2, 0x4, 0x8
@@ -115,8 +115,6 @@ def _default_dm(name):
     h = win32print.OpenPrinter(name)
     try:
         dm = win32print.GetPrinter(h, 2).get("pDevMode")
-        if dm is None:
-            dm = win32print.DocumentProperties(0, h, name, None, None, DM_OUT_BUFFER)
     finally:
         win32print.ClosePrinter(h)
     if dm is None:
@@ -171,21 +169,50 @@ def apply_profile(dm, p):
     return dm
 
 
+def _owner_window():
+    """Tiny invisible always-on-top window; the driver window is owned by it,
+    so the driver window opens on top of everything."""
+    try:
+        hwnd = win32gui.CreateWindowEx(
+            win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW, "STATIC", "PhonePrint",
+            win32con.WS_POPUP, 0, 0, 0, 0, 0, 0, 0, None)
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNA)
+        try:
+            # a tap on ALT lets a background app take the foreground
+            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        return hwnd
+    except Exception:
+        return 0
+
+
 def driver_dialog(name, base_profile=None):
-    """Open the printer driver's own settings window (like Word's Printer Properties).
-    Starts from the printer's current defaults (or from base_profile).
-    Returns a profile dict, or None if the user pressed Cancel.
+    """Open the printer driver's own settings window (like Word's Printer Properties),
+    on top of all other windows. Starts from the printer's current defaults (or from
+    base_profile). Returns a profile dict, or None if the user pressed Cancel.
     Nothing is saved to Windows: printer defaults on the PC stay untouched."""
     base = _default_dm(name)
     if base_profile:
         apply_profile(base, base_profile)
+    owner = _owner_window()
     h = win32print.OpenPrinter(name)
     try:
-        out = win32print.DocumentProperties(0, h, name, None, None, DM_OUT_BUFFER)
-        r = win32print.DocumentProperties(0, h, name, out, base,
+        # separate DEVMODE object used as the output buffer
+        out = win32print.GetPrinter(h, 2).get("pDevMode")
+        if out is None:
+            raise RuntimeError("This printer driver gave no settings")
+        r = win32print.DocumentProperties(owner, h, name, out, base,
                                           DM_IN_BUFFER | DM_IN_PROMPT | DM_OUT_BUFFER)
     finally:
         win32print.ClosePrinter(h)
+        if owner:
+            try:
+                win32gui.DestroyWindow(owner)
+            except Exception:
+                pass
     if isinstance(r, int) and r != IDOK:
         return None
     result = out if (r is None or isinstance(r, int)) else r
