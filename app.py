@@ -94,32 +94,44 @@ class App:
         r = self.root = tk.Tk()
         r.title("Phone Print")
         r.configure(bg=BG)
-        r.resizable(False, False)
+        r.minsize(320, 240)
+        r.grid_rowconfigure(0, weight=1)
+        r.grid_columnconfigure(0, weight=1)
+        self.cv = tk.Canvas(r, bg=BG, highlightthickness=0)
+        self.sb = tk.Scrollbar(r, orient="vertical", command=self.cv.yview)
+        self.cv.configure(yscrollcommand=self.sb.set)
+        self.cv.grid(row=0, column=0, sticky="nsew")
+        self.sb.grid(row=0, column=1, sticky="ns")
+        b = self.body = tk.Frame(self.cv, bg=BG)
+        self.win = self.cv.create_window(0, 0, window=b, anchor="n")
+        b.bind("<Configure>", self.on_body)
+        self.cv.bind("<Configure>", self.on_cv)
+        r.bind_all("<MouseWheel>", self.wheel)
 
         # header
         self.head_img = ImageTk.PhotoImage(gradient(W, 110))
-        hd = tk.Canvas(r, width=W, height=110, highlightthickness=0, bg=BG)
+        hd = tk.Canvas(b, width=W, height=110, highlightthickness=0, bg=BG)
         hd.pack()
         hd.create_image(0, 0, image=self.head_img, anchor="nw")
         hd.create_text(W / 2, 44, text="🖨  Phone Print", fill="white", font=(FONT, 22, "bold"))
         hd.create_text(W / 2, 78, text="Print from your phone, instantly", fill="#f5e9ff", font=(FONT, 10))
 
         # status pill
-        self.pill = tk.Canvas(r, width=130, height=30, bg=BG, highlightthickness=0)
+        self.pill = tk.Canvas(b, width=130, height=30, bg=BG, highlightthickness=0)
         self.pill.pack(pady=(14, 8))
         self.pill_bg = rrect(self.pill, 1, 1, 129, 29, 14, fill=PILL[IDLE], outline="")
         self.pill_dot = self.pill.create_oval(16, 10, 26, 20, fill=IDLE, outline="")
         self.pill_txt = self.pill.create_text(80, 15, text="Stopped", fill=FG, font=(FONT, 10, "bold"))
 
         # QR
-        self.qr = tk.Label(r, bg=BG, bd=0)
+        self.qr = tk.Label(b, bg=BG, bd=0)
         self.qr.pack(pady=(2, 8))
-        self.url = tk.Label(r, bg=BG, fg=LINK, font=(FONT, 13, "bold"))
+        self.url = tk.Label(b, bg=BG, fg=LINK, font=(FONT, 13, "bold"))
         self.url.pack()
-        tk.Label(r, text="Scan with your phone (same Wi-Fi)", bg=BG, fg=MUT, font=(FONT, 9)).pack(pady=(2, 12))
+        tk.Label(b, text="Scan with your phone (same Wi-Fi)", bg=BG, fg=MUT, font=(FONT, 9)).pack(pady=(2, 12))
 
         # buttons
-        row = tk.Frame(r, bg=BG)
+        row = tk.Frame(b, bg=BG)
         row.pack()
         self.copy_btn = RBtn(row, "Copy link", self.copy, TEAL, TEAL_H)
         self.copy_btn.pack(side="left", padx=5)
@@ -127,7 +139,7 @@ class App:
         self.set_btn.pack(side="left", padx=5)
 
         # settings (inside a slot so layout never jumps around)
-        self.slot = tk.Frame(r, bg=BG)
+        self.slot = tk.Frame(b, bg=BG)
         self.slot.pack(fill="x", padx=28, pady=(12, 18))
         self.panel = tk.Frame(self.slot, bg=CARD, padx=18, pady=16)
 
@@ -166,12 +178,36 @@ class App:
         self.center()
 
     # ---------- helpers ----------
+    def on_body(self, e=None):
+        self.cv.configure(scrollregion=self.cv.bbox("all"))
+        self.update_sb()
+
+    def on_cv(self, e):
+        self.cv.coords(self.win, e.width / 2, 0)
+        self.update_sb()
+
+    def update_sb(self):
+        if self.body.winfo_reqheight() <= self.cv.winfo_height():
+            self.sb.grid_remove()
+            self.cv.yview_moveto(0)
+        else:
+            self.sb.grid()
+
+    def wheel(self, e):
+        if self.sb.winfo_ismapped():
+            self.cv.yview_scroll(-1 * (e.delta // 120), "units")
+
     def center(self):
+        """Fit the window to its content (never taller than the screen) and center it.
+        The window can still be resized by hand; extra content scrolls."""
         self.root.update_idletasks()
-        w, h = self.root.winfo_width(), self.root.winfo_height()
-        x = (self.root.winfo_screenwidth() - w) // 2
-        y = max(10, (self.root.winfo_screenheight() - h) // 3)
-        self.root.geometry(f"+{x}+{y}")
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        bw, bh = self.body.winfo_reqwidth(), self.body.winfo_reqheight()
+        h = min(bh, sh - 100)
+        w = bw + (20 if bh > h else 0)
+        x = (sw - w) // 2
+        y = max(0, min((sh - h) // 3, sh - h - 70))
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def set_status(self, text, color):
         self.pill.itemconfig(self.pill_bg, fill=PILL[color])
