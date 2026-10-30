@@ -58,7 +58,7 @@ def login():
 
 
 def pub(f):
-    return {"id": f["id"], "name": f["name"], "kind": f["kind"], "pages": f["pages"]}
+    return {"id": f["id"], "name": f["name"], "kind": f["kind"], "pages": f["pages"], "lands": f["lands"]}
 
 
 @app.get("/api/files")
@@ -81,6 +81,10 @@ def upload():
             with LOCK:
                 d = fitz.open(path)
                 n = d.page_count
+                lands = []
+                for i in range(n):
+                    r = d.load_page(i).rect
+                    lands.append(r.width > r.height)
                 d.close()
             if n < 1:
                 raise ValueError("empty PDF")
@@ -88,7 +92,11 @@ def upload():
         elif ext in IMG_EXT:
             with Image.open(path) as im:
                 im.verify()
-            kind, n = "img", 1
+            with Image.open(path) as im:
+                w, h = im.size
+                if im.getexif().get(274, 1) in (5, 6, 7, 8):
+                    w, h = h, w
+            kind, n, lands = "img", 1, [w > h]
         else:
             raise ValueError("only PDF and image files are allowed")
     except Exception as e:
@@ -97,7 +105,7 @@ def upload():
         except Exception:
             pass
         return jsonify(error=f"{name}: {e}"), 400
-    FILES[fid] = {"id": fid, "name": name, "kind": kind, "pages": n, "path": path}
+    FILES[fid] = {"id": fid, "name": name, "kind": kind, "pages": n, "lands": lands, "path": path}
     ORDER.append(fid)
     return jsonify(pub(FILES[fid]))
 
@@ -122,7 +130,7 @@ def del_all():
 
 
 def compose(f, idx, W, H, mono, rotate=True):
-    """Draw one page fitted (and centered) on a white sheet of W x H pixels."""
+    """Draw one page, fitted and centered, on a white sheet of W x H pixels."""
     if f["kind"] == "pdf":
         with LOCK:
             doc = fitz.open(f["path"])
@@ -178,6 +186,23 @@ def send_img(img):
     return r
 
 
+def get_area(q):
+    """Paper + printable area from the real driver; falls back to plain paper size."""
+    orient = q.get("orient", "portrait")
+    pw = float(q.get("w", 210))
+    ph = float(q.get("h", 297))
+    if (orient == "landscape") != (pw > ph):
+        pw, ph = ph, pw
+    a = {"pw": pw, "ph": ph, "ox": 0, "oy": 0, "aw": pw, "ah": ph, "driver": False}
+    try:
+        a = printing.area(q.get("printer", ""), q.get("paper"), q.get("color") == "color",
+                          q.get("duplex", "off"), orient)
+        a["driver"] = True
+    except Exception:
+        pass
+    return a
+
+
 @app.get("/api/thumb")
 def thumb():
     f, p = get_page()
@@ -186,16 +211,28 @@ def thumb():
     return send_img(compose(f, p, 240, 320, False, rotate=False))
 
 
+@app.get("/api/area")
+def area():
+    return jsonify(get_area(request.args))
+
+
 @app.get("/api/preview")
 def preview():
     f, p = get_page()
     if not f:
         return "", 404
-    w = float(request.args.get("w", 210))
-    h = float(request.args.get("h", 297))
-    W = 640
-    H = max(100, min(1400, int(W * h / w)))
-    return send_img(compose(f, p, W, H, request.args.get("mono") == "1", rotate=True))
+    a = get_area(request.args)
+    W = 560
+    s = W / a["pw"]
+    H = max(100, int(a["ph"] * s))
+    ox, oy = int(a["ox"] * s), int(a["oy"] * s)
+    AW = max(1, min(W - ox, int(a["aw"] * s)))
+    AH = max(1, min(H - oy, int(a["ah"] * s)))
+    mono = request.args.get("color") != "color"
+    page = compose(f, p, AW, AH, mono, rotate=True).convert("RGB")
+    sheet = Image.new("RGB", (W, H), (214, 214, 214))  # gray = area the printer cannot print on
+    sheet.paste(page, (ox, oy))
+    return send_img(sheet)
 
 
 @app.get("/api/printers")
@@ -225,16 +262,21 @@ def do_print():
         return jsonify(error="No pages selected"), 400
     if len({f["kind"] for f, _ in pages}) != 1:
         return jsonify(error="Do not mix PDF and images in one print."), 400
+    try:
+        copies = max(1, min(99, int(d.get("copies", 1))))
+    except Exception:
+        copies = 1
+    orient = "landscape" if d.get("orient") == "landscape" else "portrait"
     jid = uuid.uuid4().hex[:8]
-    JOBS[jid] = {"state": "run", "done": 0}
-    mono = d.get("color") != "color"
+    JOBS[jid] = {"state": "run", "done": 0, "total": len(pages) * copies}
+    color = d.get("color") == "color"
 
     def run():
         try:
             printing.print_job(
-                d["printer"], d.get("paper"), not mono, d.get("duplex", "off"), len(pages),
+                d["printer"], d.get("paper"), color, d.get("duplex", "off"), orient, copies, len(pages),
                 lambda i, W, H, m: compose(pages[i][0], pages[i][1], W, H, m, True),
-                lambda i: JOBS[jid].update(done=i),
+                lambda done, total: JOBS[jid].update(done=done, total=total),
                 d.get("title", "Phone Print"))
             JOBS[jid]["state"] = "done"
         except Exception as e:
