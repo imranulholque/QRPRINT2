@@ -1,10 +1,11 @@
 import win32print, win32ui, win32gui
-from PIL import ImageWin
+from PIL import ImageWin, Image
 
-DM_PAPERSIZE, DM_PAPERLENGTH, DM_PAPERWIDTH = 0x2, 0x4, 0x8
-DM_COLOR, DM_DUPLEX, DM_FORMNAME = 0x800, 0x1000, 0x10000
+DM_ORIENTATION, DM_PAPERSIZE, DM_PAPERLENGTH, DM_PAPERWIDTH = 0x1, 0x2, 0x4, 0x8
+DM_COPIES, DM_COLOR, DM_DUPLEX, DM_FORMNAME = 0x100, 0x800, 0x1000, 0x10000
 DC_PAPERS, DC_PAPERSIZE, DC_DUPLEX, DC_PAPERNAMES, DC_COLORDEVICE = 2, 3, 7, 16, 32
-HORZRES, VERTRES, LOGPIXELSX = 8, 10, 88
+HORZRES, VERTRES, LOGPIXELSX, LOGPIXELSY = 8, 10, 88, 90
+PHYSICALWIDTH, PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY = 110, 111, 112, 113
 
 
 def list_printers():
@@ -58,7 +59,6 @@ def caps(name):
             pass
         papers.append({"name": n, "id": int(ids[i]) if i < len(ids) else None,
                        "w": w, "h": hh, "custom": False})
-    # custom paper forms added by the user in Windows / driver
     for fm in forms:
         n = fm.get("Name")
         if n and n not in seen and fm.get("Flags", 1) in (0, 2):
@@ -75,7 +75,7 @@ def caps(name):
             for p in papers:
                 if p["id"] == pid:
                     d["paper"] = p["name"]
-            if pid == 256:  # driver has a user-defined custom size set
+            if pid == 256:
                 pw, pl = int(dm.PaperWidth), int(dm.PaperLength)
                 nm = f"Custom {pw/10:g} x {pl/10:g} mm"
                 papers.append({"name": nm, "id": 256, "pw": pw, "pl": pl,
@@ -98,8 +98,8 @@ def caps(name):
             "duplex": cap(DC_DUPLEX) == 1, "defaults": d}
 
 
-def print_job(name, paper, color, duplex, n, provider, progress, title="Phone Print"):
-    c = caps(name)
+def build_dm(name, paper, color, duplex, orient, c):
+    """Take the driver's own default settings and change only what the user chose."""
     h = win32print.OpenPrinter(name)
     try:
         dm = win32print.GetPrinter(h, 2).get("pDevMode")
@@ -107,6 +107,8 @@ def print_job(name, paper, color, duplex, n, provider, progress, title="Phone Pr
             dm = win32print.DocumentProperties(0, h, name, None, None, 2)
     finally:
         win32print.ClosePrinter(h)
+    if dm is None:
+        raise RuntimeError("This printer driver gave no settings")
 
     p = next((x for x in c["papers"] if x["name"] == paper), None)
     if p:
@@ -115,10 +117,17 @@ def print_job(name, paper, color, duplex, n, provider, progress, title="Phone Pr
             dm.Fields |= DM_PAPERSIZE | DM_PAPERWIDTH | DM_PAPERLENGTH
         elif p["id"]:
             dm.PaperSize = p["id"]
-            dm.Fields = (dm.Fields | DM_PAPERSIZE) & ~DM_FORMNAME
+            dm.Fields = (dm.Fields | DM_PAPERSIZE) & ~(DM_FORMNAME | DM_PAPERLENGTH | DM_PAPERWIDTH)
         else:
             dm.FormName = p["name"]
-            dm.Fields = (dm.Fields | DM_FORMNAME) & ~DM_PAPERSIZE
+            dm.Fields = (dm.Fields | DM_FORMNAME) & ~(DM_PAPERSIZE | DM_PAPERLENGTH | DM_PAPERWIDTH)
+
+    dm.Orientation = 2 if orient == "landscape" else 1
+    dm.Fields |= DM_ORIENTATION
+
+    dm.Copies = 1
+    dm.Fields |= DM_COPIES
+
     if c["color"]:
         dm.Color = 2 if color else 1
         dm.Fields |= DM_COLOR
@@ -127,20 +136,58 @@ def print_job(name, paper, color, duplex, n, provider, progress, title="Phone Pr
     if c["duplex"]:
         dm.Duplex = {"long": 2, "short": 3}.get(duplex, 1)
         dm.Fields |= DM_DUPLEX
+    return dm, color
 
-    hdc = win32ui.CreateDCFromHandle(win32gui.CreateDC("WINSPOOL", name, dm))
+
+def open_dc(name, dm):
+    return win32ui.CreateDCFromHandle(win32gui.CreateDC("WINSPOOL", name, dm))
+
+
+def area(name, paper, color, duplex, orient):
+    """Real paper size and printable area (mm) as the driver reports them."""
+    c = caps(name)
+    dm, _ = build_dm(name, paper, color, duplex, orient, c)
+    hdc = open_dc(name, dm)
+    try:
+        dx = hdc.GetDeviceCaps(LOGPIXELSX) or 300
+        dy = hdc.GetDeviceCaps(LOGPIXELSY) or dx
+
+        def mm(i, d):
+            return hdc.GetDeviceCaps(i) / d * 25.4
+        return {"pw": mm(PHYSICALWIDTH, dx), "ph": mm(PHYSICALHEIGHT, dy),
+                "ox": mm(PHYSICALOFFSETX, dx), "oy": mm(PHYSICALOFFSETY, dy),
+                "aw": mm(HORZRES, dx), "ah": mm(VERTRES, dy)}
+    finally:
+        hdc.DeleteDC()
+
+
+def print_job(name, paper, color, duplex, orient, copies, n, provider, progress, title="Phone Print"):
+    c = caps(name)
+    dm, color = build_dm(name, paper, color, duplex, orient, c)
+    two_sided = c["duplex"] and duplex != "off"
+
+    seq = []
+    for k in range(copies):
+        seq += list(range(n))
+        if two_sided and n % 2 == 1 and k < copies - 1:
+            seq.append(None)  # blank back side so the next copy starts on a new sheet
+
+    hdc = open_dc(name, dm)
     try:
         W, H = hdc.GetDeviceCaps(HORZRES), hdc.GetDeviceCaps(VERTRES)
         dpi = hdc.GetDeviceCaps(LOGPIXELSX) or 300
         f = min(1.0, 300.0 / dpi)
         rw, rh = max(1, int(W * f)), max(1, int(H * f))
         hdc.StartDoc(title)
-        for i in range(n):
-            img = provider(i, rw, rh, not color)
+        for j, i in enumerate(seq):
+            if i is None:
+                img = Image.new("L" if not color else "RGB", (rw, rh), 255 if not color else (255, 255, 255))
+            else:
+                img = provider(i, rw, rh, not color)
             hdc.StartPage()
             ImageWin.Dib(img).draw(hdc.GetHandleOutput(), (0, 0, W, H))
             hdc.EndPage()
-            progress(i + 1)
+            progress(j + 1, len(seq))
         hdc.EndDoc()
     except Exception:
         try:
