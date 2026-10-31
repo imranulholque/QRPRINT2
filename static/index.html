@@ -95,7 +95,15 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
           <option value="short">Short edge</option>
         </select></div>
       <div class="field"><label>Copies</label><input id="copies" type="number" min="1" max="99" value="1" inputmode="numeric"></div>
-      <div class="field"><label>Scaling</label><select id="scale"></select><p class="mut" id="scnote"></p></div>
+      <div class="field"><label>Scaling</label><select id="scale"></select>
+        <div id="pctbox" class="row" hidden>
+          <button id="pctm" type="button">−</button>
+          <input id="pct" type="number" min="10" max="400" step="5" value="100" inputmode="numeric" style="width:90px">
+          <span>%</span>
+          <button id="pctp" type="button">+</button>
+        </div>
+        <input id="pctr" type="range" min="10" max="300" step="5" value="100" hidden>
+        <p class="mut" id="scnote"></p></div>
       <p class="mut" id="dnote"></p>
       <div class="row">
         <button id="bprev" class="grow">👁 Preview</button>
@@ -109,7 +117,11 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
 <div id="pv" hidden>
   <div class="wrap">
     <div class="row"><button id="pvclose">✕ Close</button><div class="name grow" id="pvtitle">Print preview</div></div>
-    <div class="field" style="margin-top:12px"><label>Scaling</label><select id="pvscale"></select></div>
+    <div class="field" style="margin-top:12px"><label>Scaling</label><select id="pvscale"></select>
+      <div id="pvpct" class="row" hidden>
+        <button id="pvpm" type="button">−</button><span class="name" id="pvpv">100%</span><button id="pvpp" type="button">+</button>
+      </div>
+    </div>
     <div class="pvstage" id="pvstage"></div>
     <div class="row" style="justify-content:center">
       <button id="pvprev">‹ Prev</button><span id="pvpos" class="name"></span><button id="pvnext">Next ›</button>
@@ -266,20 +278,38 @@ function orient(){
 function params(){
   const pp=CAPS&&CAPS.papers?CAPS.papers.find(x=>x.name===$('#paper').value):null;
   return new URLSearchParams({printer:$('#printer').value,paper:$('#paper').value,color:$('#color').value,
-    duplex:CAPS&&CAPS.duplex?$('#duplex').value:'off',orient:orient(),scale:$('#scale').value,
+    duplex:CAPS&&CAPS.duplex?$('#duplex').value:'off',orient:orient(),scale:$('#scale').value,pct:setPct($('#pct').value),
     w:(pp&&pp.w)||210,h:(pp&&pp.h)||297}).toString();
 }
 
 /* ---- scaling + preview ---- */
-const SC=[['fit','Fit to printable area'],['actual','Actual size (100%)'],['fill','Fill page (crop)']];
+const SC=[['fit','Fit to printable area'],['actual','Actual size (100%)'],['fill','Fill page (crop)'],['custom','Custom %']];
 const SCN={fit:'Whole page fitted inside the printable area. Nothing is cut off.',
   actual:'Real size. Anything outside the printer\'s printable area is cut off.',
-  fill:'Page covers the whole printable area. The extra part is cropped.'};
+  fill:'Page covers the whole printable area. The extra part is cropped.',
+  custom:'Percent of the real size (100% = actual size), always centered. Anything outside the printable area is cut off.'};
 ['#scale','#pvscale'].forEach(id=>SC.forEach(([v,t])=>$(id).append(new Option(t,v))));
-function setScale(v){$('#scale').value=v;$('#pvscale').value=v;$('#scnote').textContent=SCN[v]}
+function setScale(v){
+  $('#scale').value=v;$('#pvscale').value=v;$('#scnote').textContent=SCN[v];
+  $('#pctbox').hidden=$('#pctr').hidden=v!=='custom';
+  $('#pvpct').hidden=v!=='custom';
+}
+function setPct(v){
+  v=Math.max(10,Math.min(400,Math.round(parseFloat(v)||100)));
+  $('#pct').value=v;$('#pctr').value=Math.min(300,v);$('#pvpv').textContent=v+'%';return v;
+}
+let pctT=null;
+function pctChanged(){if(!$('#pv').hidden){clearTimeout(pctT);pctT=setTimeout(pvShow,350)}}
+$('#pct').oninput=()=>{if($('#pct').value!=='')pctChanged()};
+$('#pct').onchange=()=>{setPct($('#pct').value);pctChanged()};
+$('#pctr').oninput=()=>{setPct($('#pctr').value);pctChanged()};
+$('#pctm').onclick=()=>{setPct((parseFloat($('#pct').value)||100)-5);pctChanged()};
+$('#pctp').onclick=()=>{setPct((parseFloat($('#pct').value)||100)+5);pctChanged()};
 setScale('fit');
 $('#scale').onchange=()=>setScale($('#scale').value);
 $('#pvscale').onchange=()=>{setScale($('#pvscale').value);pvShow()};
+$('#pvpm').onclick=()=>{setPct((parseFloat($('#pct').value)||100)-5);pvShow()};
+$('#pvpp').onclick=()=>{setPct((parseFloat($('#pct').value)||100)+5);pvShow()};
 
 let PV={list:[],i:0,step:1};
 const dupOn=()=>CAPS&&CAPS.duplex&&!$('#profile').value&&$('#duplex').value!=='off';
@@ -330,7 +360,7 @@ $('#bprint').onclick=async()=>{
   const copies=Math.max(1,Math.min(99,parseInt($('#copies').value)||1));
   const body={printer:$('#printer').value,paper:$('#paper').value,color:$('#color').value,
     duplex:CAPS.duplex?$('#duplex').value:'off',orient:orient(),copies,
-    profile:$('#profile').value||'',scale:$('#scale').value,
+    profile:$('#profile').value||'',scale:$('#scale').value,pct:setPct($('#pct').value),
     pages:s.map(p=>[p.f,p.p]),title:CUR.title};
   msg('Sending…');
   const r=await api('/api/print',{method:'POST',headers:JH,body:JSON.stringify(body)});
