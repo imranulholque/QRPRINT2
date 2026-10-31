@@ -16,6 +16,11 @@ button,select,input[type=number],.btn{font:inherit;border-radius:10px;border:1px
 button.p,.btn.p{background:var(--pri);color:#fff;border-color:var(--pri)}
 button.x{padding:8px 12px;color:#dc2626}
 select:disabled{opacity:.5}
+#pv{position:fixed;inset:0;background:var(--bg);z-index:10;overflow:auto}
+.pvstage{display:flex;gap:10px;justify-content:center;align-items:flex-start;margin:10px 0}
+.pvsheet{flex:1;min-width:0;max-width:420px;text-align:center}
+.pvsheet img{width:100%;display:block;border-radius:4px;box-shadow:0 2px 12px rgba(0,0,0,.35);background:#fff;min-height:120px}
+.lg{display:inline-block;width:12px;height:12px;vertical-align:-1px;margin-right:4px;border-radius:2px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .grow{flex:1;min-width:0}
 .name{font-weight:600;overflow-wrap:anywhere}
@@ -90,6 +95,7 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
           <option value="short">Short edge</option>
         </select></div>
       <div class="field"><label>Copies</label><input id="copies" type="number" min="1" max="99" value="1" inputmode="numeric"></div>
+      <div class="field"><label>Scaling</label><select id="scale"></select><p class="mut" id="scnote"></p></div>
       <p class="mut" id="dnote"></p>
       <div class="row">
         <button id="bprev" class="grow">👁 Preview</button>
@@ -97,8 +103,22 @@ input[type=tel]{font:inherit;font-size:28px;letter-spacing:12px;text-align:cente
       </div>
       <p id="pmsg"></p>
     </div>
-    <p class="mut" id="ainfo"></p>
-    <div id="prev"></div>
+  </div>
+</div>
+
+<div id="pv" hidden>
+  <div class="wrap">
+    <div class="row"><button id="pvclose">✕ Close</button><div class="name grow" id="pvtitle">Print preview</div></div>
+    <div class="field" style="margin-top:12px"><label>Scaling</label><select id="pvscale"></select></div>
+    <div class="pvstage" id="pvstage"></div>
+    <div class="row" style="justify-content:center">
+      <button id="pvprev">‹ Prev</button><span id="pvpos" class="name"></span><button id="pvnext">Next ›</button>
+    </div>
+    <p class="mut" style="text-align:center">
+      <span class="lg" style="background:#cdd0d6;border:1px solid #888"></span>printer cannot print here &nbsp;
+      <span class="lg" style="background:#fff;border:2px dashed #2563eb"></span>printable area
+    </p>
+    <p class="mut" id="pvinfo"></p>
   </div>
 </div>
 
@@ -163,7 +183,7 @@ function openPrint(title,pages){
       el('img',{loading:'lazy',src:`/api/thumb?f=${p.f}&p=${p.p}`}),el('span',{textContent:p.label}));
     p.cb=lb.firstChild;g.append(lb);
   });
-  $('#prev').innerHTML='';$('#ainfo').textContent='';msg('');$('#copies').value=1;$('#orient').value='auto';
+  msg('');$('#copies').value=1;$('#orient').value='auto';
   $('#dlg').hidden=false;loadPrinters();
 }
 $('#close').onclick=()=>{$('#dlg').hidden=true};
@@ -246,32 +266,71 @@ function orient(){
 function params(){
   const pp=CAPS&&CAPS.papers?CAPS.papers.find(x=>x.name===$('#paper').value):null;
   return new URLSearchParams({printer:$('#printer').value,paper:$('#paper').value,color:$('#color').value,
-    duplex:CAPS&&CAPS.duplex?$('#duplex').value:'off',orient:orient(),
+    duplex:CAPS&&CAPS.duplex?$('#duplex').value:'off',orient:orient(),scale:$('#scale').value,
     w:(pp&&pp.w)||210,h:(pp&&pp.h)||297}).toString();
 }
 
-$('#bprev').onclick=async()=>{
+/* ---- scaling + preview ---- */
+const SC=[['fit','Fit to printable area'],['actual','Actual size (100%)'],['fill','Fill page (crop)']];
+const SCN={fit:'Whole page fitted inside the printable area. Nothing is cut off.',
+  actual:'Real size. Anything outside the printer\'s printable area is cut off.',
+  fill:'Page covers the whole printable area. The extra part is cropped.'};
+['#scale','#pvscale'].forEach(id=>SC.forEach(([v,t])=>$(id).append(new Option(t,v))));
+function setScale(v){$('#scale').value=v;$('#pvscale').value=v;$('#scnote').textContent=SCN[v]}
+setScale('fit');
+$('#scale').onchange=()=>setScale($('#scale').value);
+$('#pvscale').onchange=()=>{setScale($('#pvscale').value);pvShow()};
+
+let PV={list:[],i:0,step:1};
+const dupOn=()=>CAPS&&CAPS.duplex&&!$('#profile').value&&$('#duplex').value!=='off';
+$('#bprev').onclick=()=>{
   const s=sel();if(!s.length)return alert('Select at least one page');
-  const q=params();
-  const box=$('#prev');box.innerHTML='';
-  s.forEach((p,i)=>box.append(el('div',{className:'sheet'},
-    el('img',{src:`/api/preview?f=${p.f}&p=${p.p}&${q}`}),
-    el('small',{textContent:`Page ${i+1} of ${s.length}`}))));
+  if(!CAPS||CAPS.error)return alert('Select a printer first');
+  PV={list:s,i:0,step:dupOn()?2:1};
+  $('#pv').hidden=false;pvShow();
+};
+async function pvShow(){
+  const q=params(),stage=$('#pvstage');stage.innerHTML='';
+  const items=PV.list.slice(PV.i,PV.i+PV.step),n=PV.list.length;
+  let left=items.length;
+  $('#pvinfo').textContent='Loading preview…';
+  items.forEach((p,k)=>{
+    const im=el('img',{alt:''});
+    im.onload=im.onerror=()=>{if(--left===0)pvInfo(q)};
+    im.src=`/api/preview?f=${p.f}&p=${p.p}&${q}`;
+    const cap=PV.step===2?(k===0?'Front':'Back')+` · page ${PV.i+k+1}`:`Page ${PV.i+1} of ${n}`;
+    stage.append(el('div',{className:'pvsheet'},im,el('small',{className:'mut',textContent:cap})));
+  });
+  const a=PV.i+1,b=PV.i+items.length;
+  $('#pvpos').textContent=(items.length>1?`${a}–${b}`:`${a}`)+` / ${n}`;
+  $('#pvprev').disabled=PV.i<=0;
+  $('#pvnext').disabled=PV.i+PV.step>=n;
+}
+async function pvInfo(q){
   try{
     const a=await (await api('/api/area?'+q)).json();
-    $('#ainfo').textContent=(a.driver?'From driver: ':'Estimated: ')+
-      `paper ${a.pw.toFixed(0)} × ${a.ph.toFixed(0)} mm, printable area ${a.aw.toFixed(0)} × ${a.ah.toFixed(0)} mm. `+
-      'Gray = printer cannot print there. The page is fitted inside the white area.';
-  }catch{}
-  $('#ainfo').scrollIntoView();
-};
+    $('#pvinfo').textContent=(a.driver?'From the printer driver: ':'Estimated (driver gave no area): ')+
+      `paper ${a.pw.toFixed(0)} × ${a.ph.toFixed(0)} mm, printable area ${a.aw.toFixed(0)} × ${a.ah.toFixed(0)} mm.`+
+      (dupOn()?' Two-sided: front and back are shown together.':'');
+  }catch{$('#pvinfo').textContent=''}
+}
+$('#pvprev').onclick=()=>{PV.i=Math.max(0,PV.i-PV.step);pvShow()};
+$('#pvnext').onclick=()=>{if(PV.i+PV.step<PV.list.length){PV.i+=PV.step;pvShow()}};
+$('#pvclose').onclick=()=>{$('#pv').hidden=true;$('#pvstage').innerHTML=''};
+let tx=null;
+$('#pvstage').addEventListener('touchstart',e=>{tx=e.touches[0].clientX},{passive:true});
+$('#pvstage').addEventListener('touchend',e=>{
+  if(tx===null)return;const dx=e.changedTouches[0].clientX-tx;tx=null;
+  if(dx<-50)$('#pvnext').click();else if(dx>50)$('#pvprev').click();
+},{passive:true});
+
 $('#bprint').onclick=async()=>{
   const s=sel();if(!s.length)return alert('Select at least one page');
   if(!CAPS||CAPS.error)return alert('Select a printer first');
   const copies=Math.max(1,Math.min(99,parseInt($('#copies').value)||1));
   const body={printer:$('#printer').value,paper:$('#paper').value,color:$('#color').value,
     duplex:CAPS.duplex?$('#duplex').value:'off',orient:orient(),copies,
-    profile:$('#profile').value||'',
+    profile:$('#profile').value||'',scale:$('#scale').value,
     pages:s.map(p=>[p.f,p.p]),title:CUR.title};
   msg('Sending…');
   const r=await api('/api/print',{method:'POST',headers:JH,body:JSON.stringify(body)});
