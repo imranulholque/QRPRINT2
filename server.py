@@ -162,19 +162,30 @@ def del_all():
     return jsonify(ok=True)
 
 
-SCALES = ("fit", "actual", "fill")
+SCALES = ("fit", "actual", "fill", "custom")
 
 
-def compose(f, idx, W, H, mono, rotate=True, mode="fit", ppmm=None):
+def get_pct(v):
+    """Custom scaling percent (of actual size), kept between 10 and 400."""
+    try:
+        return max(10.0, min(400.0, float(v)))
+    except Exception:
+        return 100.0
+
+
+def compose(f, idx, W, H, mono, rotate=True, mode="fit", ppmm=None, pct=100.0):
     """Draw one page on a white sheet of W x H pixels.
     mode "fit":    whole page fitted inside the area, nothing cut off
     mode "actual": real size (needs ppmm = pixels per mm), may be cut at the edges
-    mode "fill":   page covers the whole area, the extra part is cropped"""
+    mode "fill":   page covers the whole area, the extra part is cropped
+    mode "custom": real size x pct/100, centered (needs ppmm), may be cut at the edges"""
     def pick(fw, fh, unit_mm):
         if mode == "fill":
             s = max(W / fw, H / fh)
         elif mode == "actual" and ppmm:
             s = ppmm * unit_mm
+        elif mode == "custom" and ppmm:
+            s = ppmm * unit_mm * pct / 100.0
         else:
             s = min(W / fw, H / fh)
         return min(s, 8000.0 / max(fw, fh))  # safety cap for huge pages
@@ -286,7 +297,8 @@ def preview():
     AW = max(1, min(W - ox, int(a["aw"] * s)))
     AH = max(1, min(H - oy, int(a["ah"] * s)))
     mono = request.args.get("color") != "color"
-    page = compose(f, p, AW, AH, mono, rotate=True, mode=mode, ppmm=s).convert("RGB")
+    page = compose(f, p, AW, AH, mono, rotate=True, mode=mode, ppmm=s,
+                   pct=get_pct(request.args.get("pct"))).convert("RGB")
     sheet = Image.new("RGB", (W, H), (205, 208, 214))  # gray = area the printer cannot print on
     sheet.paste(page, (ox, oy))
     d = ImageDraw.Draw(sheet)
@@ -393,18 +405,19 @@ def do_print():
     color = d.get("color") == "color"
     profile = find_profile(d.get("printer", ""), d.get("profile"))  # None = normal way
     mode = d.get("scale") if d.get("scale") in SCALES else "fit"
+    pct = get_pct(d.get("pct"))
 
     def run():
         try:
             area_mm = None
-            if mode == "actual":  # real size needs the printable width in mm
+            if mode in ("actual", "custom"):  # real size needs the printable width in mm
                 area_mm = get_area({"printer": d["printer"], "paper": d.get("paper"),
                                     "color": "color" if color else "mono",
                                     "duplex": d.get("duplex", "off"), "orient": orient})["aw"]
             printing.print_job(
                 d["printer"], d.get("paper"), color, d.get("duplex", "off"), orient, copies, len(pages),
                 lambda i, W, H, m: compose(pages[i][0], pages[i][1], W, H, m, True, mode,
-                                           (W / area_mm) if area_mm else None),
+                                           (W / area_mm) if area_mm else None, pct),
                 lambda done, total: JOBS[jid].update(done=done, total=total),
                 d.get("title", "Phone Print"), profile=profile)
             JOBS[jid]["state"] = "done"
