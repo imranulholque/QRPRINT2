@@ -1,7 +1,7 @@
 import os, sys, io, uuid, time, hmac, json, shutil, tempfile, threading, atexit
 from flask import Flask, request, jsonify, session, send_file
 import fitz
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 import printing
 
 
@@ -162,8 +162,23 @@ def del_all():
     return jsonify(ok=True)
 
 
-def compose(f, idx, W, H, mono, rotate=True):
-    """Draw one page, fitted and centered, on a white sheet of W x H pixels."""
+SCALES = ("fit", "actual", "fill")
+
+
+def compose(f, idx, W, H, mono, rotate=True, mode="fit", ppmm=None):
+    """Draw one page on a white sheet of W x H pixels.
+    mode "fit":    whole page fitted inside the area, nothing cut off
+    mode "actual": real size (needs ppmm = pixels per mm), may be cut at the edges
+    mode "fill":   page covers the whole area, the extra part is cropped"""
+    def pick(fw, fh, unit_mm):
+        if mode == "fill":
+            s = max(W / fw, H / fh)
+        elif mode == "actual" and ppmm:
+            s = ppmm * unit_mm
+        else:
+            s = min(W / fw, H / fh)
+        return min(s, 8000.0 / max(fw, fh))  # safety cap for huge pages
+
     if f["kind"] == "pdf":
         with LOCK:
             doc = fitz.open(f["path"])
@@ -172,7 +187,7 @@ def compose(f, idx, W, H, mono, rotate=True):
                 pw, ph = pg.rect.width, pg.rect.height
                 rot = rotate and ((pw > ph) != (W > H))
                 fw, fh = (ph, pw) if rot else (pw, ph)
-                s = min(W / fw, H / fh)
+                s = pick(fw, fh, 25.4 / 72)
                 pix = pg.get_pixmap(matrix=fitz.Matrix(s, s),
                                     colorspace=fitz.csGRAY if mono else fitz.csRGB, alpha=False)
                 img = Image.frombytes("L" if mono else "RGB", (pix.width, pix.height), pix.samples)
@@ -180,6 +195,12 @@ def compose(f, idx, W, H, mono, rotate=True):
                 doc.close()
     else:
         img = Image.open(f["path"])
+        try:
+            dpi = float((img.info.get("dpi") or (300, 300))[0])
+        except Exception:
+            dpi = 300.0
+        if dpi < 1:
+            dpi = 300.0
         img = ImageOps.exif_transpose(img)
         if img.mode in ("RGBA", "LA", "P"):
             img = img.convert("RGBA")
@@ -191,14 +212,14 @@ def compose(f, idx, W, H, mono, rotate=True):
         iw, ih = img.size
         rot = rotate and ((iw > ih) != (W > H))
         fw, fh = (ih, iw) if rot else (iw, ih)
-        s = min(W / fw, H / fh)
+        s = pick(fw, fh, 25.4 / dpi)
         img = img.resize((max(1, int(iw * s)), max(1, int(ih * s))), Image.LANCZOS)
         if mono:
             img = img.convert("L")
     if rot:
         img = img.rotate(90, expand=True)
     canvas = Image.new(img.mode, (W, H), 255 if img.mode == "L" else (255, 255, 255))
-    canvas.paste(img, ((W - img.width) // 2, (H - img.height) // 2))
+    canvas.paste(img, ((W - img.width) // 2, (H - img.height) // 2))  # larger image is cropped
     return canvas
 
 
@@ -255,16 +276,29 @@ def preview():
     if not f:
         return "", 404
     a = get_area(request.args)
-    W = 560
-    s = W / a["pw"]
+    mode = request.args.get("scale", "fit")
+    if mode not in SCALES:
+        mode = "fit"
+    W = 720
+    s = W / a["pw"]  # pixels per mm on the preview sheet
     H = max(100, int(a["ph"] * s))
     ox, oy = int(a["ox"] * s), int(a["oy"] * s)
     AW = max(1, min(W - ox, int(a["aw"] * s)))
     AH = max(1, min(H - oy, int(a["ah"] * s)))
     mono = request.args.get("color") != "color"
-    page = compose(f, p, AW, AH, mono, rotate=True).convert("RGB")
-    sheet = Image.new("RGB", (W, H), (214, 214, 214))  # gray = area the printer cannot print on
+    page = compose(f, p, AW, AH, mono, rotate=True, mode=mode, ppmm=s).convert("RGB")
+    sheet = Image.new("RGB", (W, H), (205, 208, 214))  # gray = area the printer cannot print on
     sheet.paste(page, (ox, oy))
+    d = ImageDraw.Draw(sheet)
+    blue = (37, 99, 235)
+    x1, y1, x2, y2 = ox, oy, ox + AW - 1, oy + AH - 1
+    for x in range(x1, x2, 12):  # dashed printable-area border
+        d.line((x, y1, min(x + 6, x2), y1), fill=blue, width=2)
+        d.line((x, y2, min(x + 6, x2), y2), fill=blue, width=2)
+    for y in range(y1, y2, 12):
+        d.line((x1, y, x1, min(y + 6, y2)), fill=blue, width=2)
+        d.line((x2, y, x2, min(y + 6, y2)), fill=blue, width=2)
+    d.rectangle((0, 0, W - 1, H - 1), outline=(120, 124, 132), width=2)
     return send_img(sheet)
 
 
@@ -358,12 +392,19 @@ def do_print():
     JOBS[jid] = {"state": "run", "done": 0, "total": len(pages) * copies}
     color = d.get("color") == "color"
     profile = find_profile(d.get("printer", ""), d.get("profile"))  # None = normal way
+    mode = d.get("scale") if d.get("scale") in SCALES else "fit"
 
     def run():
         try:
+            area_mm = None
+            if mode == "actual":  # real size needs the printable width in mm
+                area_mm = get_area({"printer": d["printer"], "paper": d.get("paper"),
+                                    "color": "color" if color else "mono",
+                                    "duplex": d.get("duplex", "off"), "orient": orient})["aw"]
             printing.print_job(
                 d["printer"], d.get("paper"), color, d.get("duplex", "off"), orient, copies, len(pages),
-                lambda i, W, H, m: compose(pages[i][0], pages[i][1], W, H, m, True),
+                lambda i, W, H, m: compose(pages[i][0], pages[i][1], W, H, m, True, mode,
+                                           (W / area_mm) if area_mm else None),
                 lambda done, total: JOBS[jid].update(done=done, total=total),
                 d.get("title", "Phone Print"), profile=profile)
             JOBS[jid]["state"] = "done"
