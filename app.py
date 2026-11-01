@@ -1,4 +1,4 @@
-import os, sys, json, socket, threading
+import os, sys, json, socket, threading, queue
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 if sys.stderr is None: sys.stderr = open(os.devnull, "w")
 import logging
@@ -83,6 +83,20 @@ def gradient(w, h):
         f = t - i
         a, b = STOPS[i], STOPS[i + 1]
         d.line((x, 0, x, h), fill=tuple(int(a[k] + (b[k] - a[k]) * f) for k in range(3)))
+    return img
+
+
+def tray_image():
+    """Small icon for the system tray."""
+    img = gradient(64, 64).convert("RGBA")
+    mask = Image.new("L", (64, 64), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, 63, 63), radius=14, fill=255)
+    img.putalpha(mask)
+    d = ImageDraw.Draw(img)
+    d.rectangle((20, 10, 44, 26), fill="white")             # paper in
+    d.rounded_rectangle((12, 24, 52, 46), radius=4, fill="white")   # printer body
+    d.rectangle((20, 38, 44, 54), fill="white", outline=(99, 102, 241), width=2)  # paper out
+    d.rectangle((24, 43, 40, 45), fill=(99, 102, 241))
     return img
 
 
@@ -197,7 +211,11 @@ class App:
             row=5, column=0, columnspan=2)
 
         self.draw()
-        r.protocol("WM_DELETE_WINDOW", self.close)
+        r.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.q = queue.Queue()
+        self.tray = None
+        self.init_tray()
+        r.after(200, self.poll)
 
         if self.cfg.get("pin"):
             self.start()
@@ -206,7 +224,10 @@ class App:
         r.after(5000, self.tick)
         self.center()
         if "--startup" in sys.argv and self.cfg.get("pin"):
-            r.iconify()   # started by Windows: stay in the taskbar
+            if self.tray:
+                r.withdraw()    # started by Windows: live in the system tray
+            else:
+                r.iconify()
 
     # ---------- helpers ----------
     def on_body(self, e=None):
@@ -344,8 +365,52 @@ class App:
             self.toggle_settings()
         self.center()
 
+    # ---------- system tray ----------
+    def init_tray(self):
+        try:
+            import pystray
+            import pystray._win32  # noqa: makes PyInstaller bundle the Windows backend
+            menu = pystray.Menu(
+                pystray.MenuItem("Open Phone Print", lambda icon, item: self.q.put("show"), default=True),
+                pystray.MenuItem("Quit", lambda icon, item: self.q.put("quit")))
+            self.tray = pystray.Icon("PhonePrint", tray_image(), "Phone Print", menu)
+            self.tray.run_detached()
+        except Exception:
+            self.tray = None
+
+    def poll(self):
+        """Tray clicks arrive from another thread; handle them here, in the Tk thread."""
+        try:
+            while True:
+                m = self.q.get_nowait()
+                if m == "show":
+                    self.show()
+                elif m == "quit":
+                    self.close()
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(200, self.poll)
+
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def on_close(self):
+        # with "Start with Windows" on, the X button hides the window and the server keeps running
+        if self.tray and self.cfg.get("autostart"):
+            self.root.withdraw()
+        else:
+            self.close()
+
     def close(self):
         self.stop()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         server.cleanup()
         self.root.destroy()
 
