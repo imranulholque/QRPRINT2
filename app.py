@@ -40,6 +40,29 @@ def save_cfg(c):
         json.dump(c, f)
 
 
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def set_autostart(on):
+    """Start with Windows (current user only, no admin needed). Launched with --startup."""
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            if on:
+                if getattr(sys, "frozen", False):
+                    cmd = f'"{sys.executable}" --startup'
+                else:
+                    cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" --startup'
+                winreg.SetValueEx(k, "PhonePrint", 0, winreg.REG_SZ, cmd)
+            else:
+                try:
+                    winreg.DeleteValue(k, "PhonePrint")
+                except FileNotFoundError:
+                    pass
+    except Exception:
+        pass
+
+
 def local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -164,8 +187,14 @@ class App:
         self.port.grid(row=3, column=0, pady=(4, 14), ipady=5, sticky="w")
         self.port.insert(0, str(self.cfg.get("port", 5050)))
 
+        self.auto = tk.BooleanVar(value=bool(self.cfg.get("autostart", False)))
+        tk.Checkbutton(self.panel, text="Start with Windows (opens minimized)", variable=self.auto,
+                       bg=CARD, fg=FG, selectcolor=INPUT, activebackground=CARD, activeforeground=FG,
+                       font=(FONT, 10), anchor="w", highlightthickness=0, bd=0).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
         RBtn(self.panel, "Save & Start", self.start, PINK, PINK_H, w=290, h=40, bg=CARD, fs=11).grid(
-            row=4, column=0, columnspan=2)
+            row=5, column=0, columnspan=2)
 
         self.draw()
         r.protocol("WM_DELETE_WINDOW", self.close)
@@ -176,6 +205,8 @@ class App:
             self.toggle_settings()
         r.after(5000, self.tick)
         self.center()
+        if "--startup" in sys.argv and self.cfg.get("pin"):
+            r.iconify()   # started by Windows: stay in the taskbar
 
     # ---------- helpers ----------
     def on_body(self, e=None):
@@ -304,8 +335,9 @@ class App:
             return
         server.state["pin"] = pin
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-        self.cfg = {"pin": pin, "port": port}
+        self.cfg = {"pin": pin, "port": port, "autostart": bool(self.auto.get())}
         save_cfg(self.cfg)
+        set_autostart(self.cfg["autostart"])
         self.draw()
         self.set_status("Running", OK)
         if self.settings_open:
